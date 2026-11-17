@@ -1,12 +1,18 @@
 package tarkle
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/rclone/rclone/backend/tarkle/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/rest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -146,4 +152,115 @@ func TestWalkListBatches(t *testing.T) {
 func TestFormatTime(t *testing.T) {
 	loc := time.FixedZone("x", 3600)
 	assert.Equal(t, "2001-02-03T04:05:06.500Z", formatTime(time.Date(2001, 2, 3, 5, 5, 6, 500_999_999, loc)))
+}
+
+func TestShouldRetry429(t *testing.T) {
+	respWith := func(retryAfter string) *http.Response {
+		h := http.Header{}
+		h.Set("Retry-After", retryAfter)
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h}
+	}
+	apiErr := func(code, msg string) *api.Error {
+		e := &api.Error{Status: http.StatusTooManyRequests}
+		e.Wrapper.Code = code
+		e.Wrapper.Message = msg
+		return e
+	}
+	t.Run("a daily quota is fatal with the API's message", func(t *testing.T) {
+		msg := "The Free plan allows 2,500 API calls a day. The limit resets at midnight UTC."
+		retry, err := shouldRetry(context.Background(), respWith("40000"), apiErr("quota_exceeded", msg))
+		assert.False(t, retry)
+		assert.True(t, fserrors.IsFatalError(err))
+		assert.Contains(t, err.Error(), msg)
+	})
+	t.Run("the per-minute limit waits for Retry-After", func(t *testing.T) {
+		retry, err := shouldRetry(context.Background(), respWith("7"), apiErr("rate_limited", "Too many requests"))
+		assert.True(t, retry)
+		assert.False(t, fserrors.IsFatalError(err))
+		d, ok := pacer.IsRetryAfter(err)
+		require.True(t, ok)
+		assert.Equal(t, 7*time.Second, d)
+	})
+	t.Run("any other 429 never sleeps longer than the cap", func(t *testing.T) {
+		retry, err := shouldRetry(context.Background(), respWith("86000"), apiErr("rate_limited", "x"))
+		assert.True(t, retry)
+		d, ok := pacer.IsRetryAfter(err)
+		require.True(t, ok)
+		assert.Equal(t, maxRetryAfter, d)
+	})
+}
+
+func newTestFs(t *testing.T, url string, client *http.Client) *Fs {
+	t.Helper()
+	ctx := context.Background()
+	f := &Fs{
+		conflict: &conflictCache{},
+		srv:      rest.NewClient(client).SetRoot(url + apiPath),
+		pacer:    fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(time.Millisecond), pacer.MaxSleep(time.Millisecond))),
+	}
+	f.srv.SetErrorHandler(errorHandler)
+	return f
+}
+
+func TestConflictDecisionIsCachedPerRun(t *testing.T) {
+	var conflicts, starts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		starts++
+		w.Header().Set("Content-Type", "application/json")
+		if body["on_conflict"] == nil {
+			conflicts++
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"conflict","message":"Name taken","details":{"choices":["version","separate","skip"]}}}`))
+			return
+		}
+		assert.Equal(t, "version", body["on_conflict"])
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"action":"upload","id":"u1","mode":"single"}`))
+	}))
+	defer ts.Close()
+	f := newTestFs(t, ts.URL, http.DefaultClient)
+	ctx := context.Background()
+
+	_, err := f.startUpload(ctx, "a.txt", "", 10, "text/plain", time.Time{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, conflicts, "the first file learns the answer from one 409")
+	assert.Equal(t, 2, starts)
+
+	_, err = f.startUpload(ctx, "b.txt", "", 10, "text/plain", time.Time{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, conflicts, "the second file sends on_conflict up front")
+	assert.Equal(t, 3, starts)
+}
+
+func TestEmptyFileNeverCachesOrSendsVersion(t *testing.T) {
+	f := &Fs{conflict: &conflictCache{}}
+	f.rememberConflictChoice("separate", 0)
+	assert.Equal(t, "", f.cachedConflictChoice())
+	f.rememberConflictChoice("version", 5)
+	assert.Equal(t, "version", f.cachedConflictChoice())
+}
+
+func TestAPIClientRefusesARedirectThatChangesTheCall(t *testing.T) {
+	var hits int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer other.Close()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusMovedPermanently)
+	}))
+	defer ts.Close()
+	client := &http.Client{CheckRedirect: refuseUnsafeRedirect}
+	f := newTestFs(t, ts.URL, client)
+	var out api.Workspaces
+	opts := rest.Opts{Method: "POST", Path: "/workspaces"}
+	err := f.call(context.Background(), &opts, map[string]string{"a": "b"}, &out)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirected")
+	assert.Contains(t, err.Error(), "url option")
+	assert.Equal(t, 0, hits, "the redirect target is never called")
 }

@@ -48,8 +48,14 @@ const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 20 * time.Second
 	decayConstant = 1 // bigger for slower decay, exponential
-	defaultURL    = "https://app.tarkle.com"
-	apiPath       = "/api/v1"
+	// The one named address of this backend: the primary domain of the app (the API is <url>/api/v1). The app's own host registry is
+	// lib/platform-hosts.mjs; an older saved url option keeps working, and the url option overrides this.
+	defaultURL = "https://tarkle.tech"
+	apiPath    = "/api/v1"
+
+	quotaExceededCode = "quota_exceeded"  // the API's 429 code for a daily plan quota (not worth waiting for)
+	maxRetryAfter     = 120 * time.Second // longest sleep for any other 429
+
 	// a download link lives 900 s; ask for a new one a little earlier
 	downloadLinkLife = 10 * time.Minute
 )
@@ -169,6 +175,13 @@ type Fs struct {
 	dirCache   *dircache.DirCache // Map of directory path to directory id
 	pacer      *fs.Pacer          // pacer for API calls
 	storePacer *fs.Pacer          // pacer for storage calls
+
+	conflict *conflictCache // the on_conflict answer the server gave once in this run (a pointer: Fs is copied)
+}
+
+type conflictCache struct {
+	mu     sync.Mutex
+	choice string // "version" or "separate"
 }
 
 // Object describes a tarkle object
@@ -222,7 +235,16 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		return false, err
 	}
 	if resp != nil && resp.StatusCode == http.StatusTooManyRequests && err != nil {
+		// A daily plan quota (code quota_exceeded) resets at midnight UTC, up to a day away: waiting is useless,
+		// so stop with the API's own message (it names the plan and the reset). The per-minute limit
+		// (code rate_limited) is worth waiting for.
+		if e := apiError(err); e != nil && e.Code() == quotaExceededCode {
+			return false, fserrors.FatalError(err)
+		}
 		if secs, perr := time.ParseDuration(resp.Header.Get("Retry-After") + "s"); perr == nil && secs > 0 {
+			if secs > maxRetryAfter {
+				secs = maxRetryAfter // a safety net: never sleep for hours on any other 429
+			}
 			return true, pacer.RetryAfterError(err, secs)
 		}
 	}
@@ -277,14 +299,19 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	root = parsePath(root)
 
 	client := fshttp.NewClient(ctx)
+	// The API client never follows a redirect that would turn the call into another one (a POST becomes a GET) or leave the host
+	// (Go drops the Authorization header there): that would lose the body or send the call unsigned. Fail with a clear message.
+	apiClient := *client
+	apiClient.CheckRedirect = refuseUnsafeRedirect
 	f := &Fs{
 		name:       name,
 		root:       root,
 		opt:        *opt,
-		srv:        rest.NewClient(client).SetRoot(strings.TrimRight(opt.URL, "/") + apiPath),
+		srv:        rest.NewClient(&apiClient).SetRoot(strings.TrimRight(opt.URL, "/") + apiPath),
 		store:      rest.NewClient(client),
 		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		storePacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		conflict:   &conflictCache{},
 	}
 	f.srv.SetErrorHandler(errorHandler)
 	f.srv.SetHeader("Authorization", "Bearer "+token)
@@ -1105,3 +1132,15 @@ var (
 	_ fs.ParentIDer      = (*Object)(nil)
 	_ fs.Metadataer      = (*Object)(nil)
 )
+
+// refuseUnsafeRedirect is the API client's CheckRedirect: a redirect may only go on to the same host and with the same method.
+func refuseUnsafeRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	first := via[0]
+	if req.Method != first.Method || req.URL.Host != first.URL.Host {
+		return fserrors.FatalError(fmt.Errorf("the Tarkle API address redirected %s %s to %s: set the url option to the address that answers directly", first.Method, first.URL.Redacted(), req.URL.Redacted()))
+	}
+	return nil
+}

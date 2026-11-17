@@ -211,7 +211,7 @@ Properties:
 - Config:      url
 - Env Var:     RCLONE_TARKLE_URL
 - Type:        string
-- Default:     "https://app.tarkle.com"
+- Default:     "https://tarkle.tech"
 
 #### --tarkle-list-chunk
 

@@ -117,6 +117,11 @@ func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mi
 	if dirID != "" {
 		req.FolderID = &dirID
 	}
+	// What the server asked for once is asked for up front from then on (an empty file is never sent "version": it cannot be).
+	// Without it every changed file would cost a wasted 409 first.
+	if choice := f.cachedConflictChoice(); choice != "" && (size > 0 || choice != "version") {
+		req.OnConflict = choice
+	}
 	for attempt := 0; ; attempt++ {
 		var res api.UploadStarted
 		opts := rest.Opts{Method: "POST", Path: "/uploads"}
@@ -125,7 +130,7 @@ func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mi
 			return &res, nil
 		}
 		e := apiError(err)
-		if e == nil || e.Status != http.StatusConflict || attempt > 0 {
+		if e == nil || e.Status != http.StatusConflict || attempt > 1 {
 			return nil, fmt.Errorf("failed to start upload: %w", err)
 		}
 		switch e.Code() {
@@ -134,8 +139,10 @@ func (f *Fs) startUpload(ctx context.Context, leaf, dirID string, size int64, mi
 			if size == 0 || !choiceOffered(e, "version") {
 				req.OnConflict = "separate"
 			}
+			f.rememberConflictChoice(req.OnConflict, size)
 		case "empty_version_not_supported", "version_upload_not_available":
 			req.OnConflict = "separate"
+			f.rememberConflictChoice("separate", size)
 		default:
 			return nil, fmt.Errorf("failed to start upload: %w", err)
 		}
@@ -458,3 +465,23 @@ func (w *chunkWriter) Abort(ctx context.Context) error {
 
 // newBytesReader is a ReadSeeker over data
 func newBytesReader(data []byte) io.ReadSeeker { return bytes.NewReader(data) }
+
+func (f *Fs) cachedConflictChoice() string {
+	if f.conflict == nil {
+		return ""
+	}
+	f.conflict.mu.Lock()
+	defer f.conflict.mu.Unlock()
+	return f.conflict.choice
+}
+
+// rememberConflictChoice keeps the decision for the rest of the run. An empty file's answer is not kept: it is "separate" only
+// because an empty file cannot be a version, which says nothing about the other files.
+func (f *Fs) rememberConflictChoice(choice string, size int64) {
+	if size == 0 || f.conflict == nil {
+		return
+	}
+	f.conflict.mu.Lock()
+	f.conflict.choice = choice
+	f.conflict.mu.Unlock()
+}
